@@ -1,82 +1,72 @@
 # Shared implementation contracts
 
-Status: proposed baseline. Task 02 freezes these after the Windows spike. Later changes must update this document and affected consumers together.
+Status: **frozen for tasks 03–10** after the Windows spike. Later changes must update this document and affected consumers together. The spike established audible CABLE Output → Realtek shared-mode playback alongside local audio; see `audio-spike-results.md` for observations and pending hardware tests.
 
 Read this document with your assigned task; do not read every other task spec.
 
-## Repository boundaries
+## Repository boundaries and public shapes
 
-One Rust package at the root, with `src/`; one Vite project in `ui/`.
+One Rust package at the root (`src/`), one Vite project in `ui/`. `src/audio/` owns shared audio values and Windows I/O; `src/protocol.rs` packet validation; `src/jitter.rs` ordering/playout; `src/transport.rs` UDP; `src/session.rs` lifecycle; `src/settings.rs` validation/persistence; `src/web.rs` localhost API. Target-gate Windows audio; unsupported audio returns an explicit error. No COM handles in shared types.
 
-- `src/audio/`: platform-independent audio values plus Windows device I/O.
-- `src/protocol.rs`: packet encoding/validation only.
-- `src/jitter.rs`: deterministic packet ordering/playout only.
-- `src/transport.rs`: UDP workers, peer filtering, receive timeouts.
-- `src/session.rs`: session ownership, lifecycle, state snapshots.
-- `src/settings.rs`: settings validation and persistence.
-- `src/web.rs`: local API and browser boundary checks.
-- `ui/src/`: Svelte UI and its typed API client.
+`src/contracts.rs` exports `Mode { Send, Receive }`, `DeviceKind { Capture, Playback }`, `Device { id: String, name: String, kind: DeviceKind }`, `Devices { devices: Vec<Device> }`, `Settings`, `Status`, `State`, `ErrorCode`, `ApiError`, `ErrorResponse`, and `Bootstrap`. JSON uses snake_case strings for enums, all listed fields are required (including nullable ones), and unknown fields are invalid at the API/settings boundary. Opaque endpoint IDs, not names, select devices. The existing Windows probe's `Endpoint` additionally contains diagnostic formats/periods; convert it to the public `Device` for the API. Enumerate active endpoints; do not substitute a default device for a missing ID.
 
-These are ownership boundaries, not a requirement for an elaborate framework. Introduce smaller audio files when capture/playback need separate owners. Target-specific dependencies and `cfg` keep non-Windows builds useful for pure logic tests; unsupported audio returns an explicit error.
+`Settings { version: u8, mode: Mode, capture_device_id: Option<String>, playback_device_id: Option<String>, peer_ip: String, udp_port: u16, buffer_ms: u16 }`. Default: `{"version":1,"mode":"send","capture_device_id":null,"playback_device_id":null,"peer_ip":"","udp_port":46000,"buffer_ms":30}`. Version must be 1; reject wrong types, unknown fields, ports outside 1–65535, buffer outside 10–100 ms or not divisible by 5, device IDs over 1024 bytes or empty when non-null, peer IP over 64 bytes, and bodies over 16 KiB. Save may contain an empty peer IP, nonselected or absent device IDs, or a syntactically invalid peer IP so setup can be saved; Start requires an IPv4 unicast address (not unspecified, multicast, limited broadcast or reserved 240/4) and an active endpoint of the selected kind for the chosen role. Ignore the other role's ID at Start, but never replace a missing selected endpoint. Settings parse/validation errors must preserve an existing file, including corrupt/unsupported-version files; persistence failures are reported, not ignored. Task 08 implements these checks.
 
-## Audio boundary
+`State { status: Status, mode: Option<Mode>, input_peak: f64, output_peak: f64, packets_lost: u64, buffer_ms: u16, error: Option<ApiError> }`. Status strings: `stopped`, `starting`, `listening`, `receiving`, `sending`, `stopping`, `failed`. Peaks are finite 0–1; unavailable measurements are 0. `buffer_ms` is the configured receive target for an active receiver and 0 for send/stopped/failed. `packets_lost` counts receiver playout deadlines filled with silence (not late, malformed or duplicate arrivals); 0 for sender. Reset counters/peaks/error on each new Start; retain counters on Stop and failure until the next Start, while resetting peaks to 0. Initially stopped has mode null, counters 0 and error null. Active/failed states retain the attempted mode; Stop resets mode and error to null. Sender `sending` means local UDP emission, not confirmed remote reception.
 
-- Wire audio: 48,000 frames/s, two channels, interleaved signed 16-bit samples.
-- One packet contains 240 frames, 480 samples, 960 payload bytes.
-- Internal device processing may use float samples; conversion is explicit at the wire boundary.
-- Public device records contain opaque stable `id`, `name`, and `kind` (`capture` or `playback`); never leak COM types.
-- Capture emits bounded blocks; playback consumes bounded blocks without waiting on network or HTTP work. Task 02 fixes exact Rust types, queue limits, cancellation, and worker-error reporting based on the spike.
-- Device-native rate conversion and sender/receiver clock correction are distinct responsibilities. Playback must expose an adjustable consumption ratio for task 12.
+## Audio boundary and worker ownership
 
-## Wire protocol v1
+Wire audio is 48,000 frames/s, two interleaved signed 16-bit channels. `audio::AudioBlock { frame_index: u64, samples: [i16; 480] }` holds 240 frames (5 ms); PCM is encoded little-endian at the wire boundary. Device-native formats may be float. WASAPI 0.26.0 shared/event-driven mode worked in the spike: initialize COM and create/use clients on the owning Windows worker thread; negotiate/convert rates and formats explicitly. Handle capture `Some(0)` without spinning, silent buffers and discontinuities, and device loss as an error. A discontinuity retains elapsed frame-index gaps rather than compressing the timeline. Audio workers never wait on network, file, or HTTP work.
 
-Proposed UDP audio datagram: exactly 988 bytes. No negotiation or compression.
+`audio::BlockQueue` is a shared, bounded block FIFO with `new(capacity)`, `push(block) -> bool` (true if the oldest block was dropped), `pop() -> Option<AudioBlock>`, `len()` and `is_empty()`. Use 20 blocks/100 ms for capture → sender and 4 blocks/20 ms for receiver → playback. Overflow evicts oldest blocks; never renumber `frame_index`. Queue operations are short in-memory critical sections; network operations must be outside them. Capture assembles full blocks from variable WASAPI packets; playback retains partial blocks across callbacks and outputs silence on missing frames. Start and Stop create/discard fresh queues so stale audio is never replayed.
+
+`audio::WorkerHandle { cancelled: Arc<AtomicBool>, errors: Receiver<ApiError>, thread: JoinHandle<Result<(), ApiError>> }` provides `cancel(&self)` and consuming `join(self) -> Result<(), ApiError>`. Worker implementations return `Result<CaptureWorker, ApiError>` / `Result<PlaybackWorker, ApiError>` from `start_capture(id: &str)` / `start_playback(id: &str)`, after opening the selected endpoint and confirming stream startup on its owning thread; an initialization failure joins/cleans up before returning `Err`. The returned structs contain the worker, block queue and atomic peak; playback also has `ratio`. Publish later failures through a `sync_channel(1)` via nonblocking `try_send` and return the same failure from the worker thread, so errors remain observable at join even if notification is full. Cancellation is polled around bounded event waits (at most 200 ms) and cannot depend on another worker continuing. Stop cancels all workers, closes/unblocks transport, then joins all; a join failure becomes a failed session, not an orphaned worker. Worker peaks are finite clamped f32 bits; session samples them without blocking audio.
+
+`audio::ConsumptionRatio::default()` is 1.0; `set(f32) -> Result<(), &str>` accepts finite 0.995–1.005, `get() -> f32`. Units: input frames consumed per nominal output frame; >1 consumes input faster. Playback task 04 smoothly ramps the applied value toward the requested value by at most 0.0001 per 5 ms of output and separately ensures native-rate/format conversion. Task 12 controls the ratio from receive occupancy; it resets to 1.0 per Start. The spike verified automatic shared-mode opening of one 44.1 kHz device, **not** audible 44.1 kHz quality or software-adjustable resampling. No particular resampler library is frozen; task 04 must verify the control path on hardware.
+
+## Wire protocol, timeline, and transport
+
+UDP audio datagrams are exactly 988 bytes, without negotiation or compression:
 
 | Offset | Bytes | Field |
 | --- | --- | --- |
 | 0 | 4 | ASCII `APRT` |
 | 4 | 1 | Version `1` |
-| 5 | 1 | Reserved, must be zero |
+| 5 | 1 | Reserved, zero |
 | 6 | 2 | Header length `28` |
-| 8 | 8 | Random session ID |
+| 8 | 8 | Random nonzero session ID |
 | 16 | 4 | Wrapping packet sequence |
-| 20 | 8 | Sample-frame index of first payload frame |
+| 20 | 8 | First payload sample-frame index |
 | 28 | 960 | Interleaved PCM payload |
 
-Header integers use network byte order; PCM uses little-endian. Frame index starts at zero and advances by 240, including packets discarded locally; sequence advances per packet interval. Validate length, header, and timeline consistency before buffering. Define wrapping-sequence comparison explicitly and test wraparound.
+Header integers are big-endian; samples are little-endian. The sender starts sequence and frame index at 0 and increments them by 1 and 240 respectively per 5 ms block, including locally dropped blocks. Do not compress gaps on capture overflow. Validate exact length, magic, version, reserved byte, header length, nonzero session ID, frame index divisible by 240, and sequence/timeline congruence (`frame_index / 240` modulo 2^32 equals sequence) before buffering. A forward sequence comparison is `delta = a.wrapping_sub(b)`; `a` is newer than `b` iff `0 < delta < 2^31`. At exactly 2^31, treat it as ambiguous/old. Use u64 frame indices to disambiguate long-lived streams; reject timeline regression and duplicates. Task 05 tests wraparound.
 
-UDP default port: `46000`. Sender uses an ephemeral source port; receiver binds the configured destination port. Both configure the peer IPv4 address for v1. Receiver learns the first valid session from that IP. After one second without accepted audio, it clears buffered/session data and returns to listening; a new session may then establish a fresh timeline. A different session does not replace an active one. Peer IP filtering is not authentication.
+Task 05's public `protocol::Packet { session_id: u64, sequence: u32, block: AudioBlock }` provides `encode(&Packet) -> [u8; 988]` and `decode(&[u8]) -> Result<Packet, PacketError>`; the decoder validates the wire layout before constructing a packet. Encode/decode do not own sockets or session state.
 
-Receive buffer: default 30 ms, configurable 10–100 ms in 5 ms increments. Establish the timeline from the first accepted packet and prefill the target before playout. Output silence on missing deadlines, discard late/duplicate data, and cap storage independently of timestamp gaps. Task 02 specifies the hard cap and sender queue overflow policy. Queue overflow must skip old audio rather than accumulating latency.
+UDP default port is 46000. Sender binds an ephemeral source port and sends to configured peer IPv4/port; receiver binds configured port and filters source **IP**, not source port. Receiver learns the session ID and first frame index from the first valid packet from that IP; another session cannot replace it while active. After 1 second without accepted, on-time audio, clear session and buffered data, reset ratio and return to `listening`; next valid packet may establish a new timeline. Peer IP filtering is not authentication; trusted LAN only. Receive waits must be cancellable promptly.
 
-## Settings and HTTP API
+Receiver target is 30 ms by default, configurable 10–100 ms in 5 ms steps. First accepted packet establishes the monotonic playout schedule; prefill for the configured target, then release one 240-frame block every 5 ms independent of packet arrivals. Missing deadline → silence and one `packets_lost`; discard late/duplicate packets, reorder on-time ones. Bound jitter storage at **40 packets (200 ms)** regardless of sequence/frame gaps; reject packets outside the 40-packet forward window, and evict oldest buffered audio if capacity would be exceeded. Keep the 4-block receiver → playback queue bounded too; after an overflow skip obsolete audio, never build latency. A valid packet for the active session counts toward idle timeout only if it is accepted into the current window. Task 06 owns deterministic playout, task 07 owns socket/session timeout and sender block dispatch.
 
-Settings JSON:
+Task 06's `jitter::JitterBuffer::new(buffer_ms: u16) -> Result<Self, ApiError>` owns ordered blocks and playout time, with `insert(&mut self, block: AudioBlock, now: Instant) -> bool` (accepted into the current window), `poll(&mut self, now: Instant) -> Option<(AudioBlock, bool)>` (one due block and whether it was silence for loss; `None` before the next deadline), `occupancy(&self) -> usize`, `local_skipped_blocks(&self) -> u64`, and `reset(&mut self)`. The caller polls again while deadlines are due; playback is paced by the monotonic clock, not packet arrival. On each `poll`, if the next deadline is more than **20 ms** behind `now`, calculate the latest due 5 ms slot arithmetically, advance directly to it, discard older buffered blocks, and count the skipped slots in `local_skipped_blocks`. This allows at most five emitted blocks for a single `now` across repeated polls; never loop over a long gap. Skipped slots are local scheduling loss, **not** `packets_lost`; that counter increments only when an emitted block is silence for missing network audio. Check the one-second idle timeout before attempting catch-up, so an expired session resets instead. `transport` owns the peer/session check and idle timer and calls `reset` on timeout. The returned blocks enter the bounded playback queue; queue eviction does not change the jitter loss count. Task 06 tests a synthetic long pause and ensures recovery has constant work and correct counters.
 
-```json
-{"version":1,"mode":"send","capture_device_id":null,"playback_device_id":null,"peer_ip":"","udp_port":46000,"buffer_ms":30}
-```
+## Session operations and HTTP
 
-Incomplete settings may be saved for setup; Start requires a valid unicast IPv4 peer and an available selected device for the role. Reject unknown schema versions, wrong types, invalid ranges, and oversized input. Do not silently migrate unsupported versions or erase a corrupt settings file.
+`src/session.rs` exposes a concrete `SessionController` with `snapshot(&self) -> State`, `start(&mut self, settings: &Settings) -> Result<State, ApiError>`, and `stop(&mut self) -> Result<State, ApiError>` (HTTP handlers hold session ownership outside the async executor; use blocking work off Tokio threads). There is one session per process. Invalid Start settings return 400 while staying stopped; endpoint validation failure before worker startup returns 503 while staying stopped. Once startup begins: `stopped → starting → sending` for send; `stopped → starting → listening ↔ receiving` for receive. Stop from any non-stopped state moves through `stopping → stopped` after joining; a join failure instead ends in `failed`. Startup or asynchronous worker failure cancels/joins peers and transitions to `failed` with an actionable error; failed requires Stop before another Start. Start when not stopped, or settings mutation while not stopped, is a lifecycle conflict. Stop while stopped is idempotent. Task 09 may use a **development-only** stub of these operations until task 11 wires real workers; stub Start returns `backend_unavailable` (503) rather than simulating successful production audio.
 
-- `GET /api/devices`: `{ "devices": [Device] }`.
-- `GET /api/state`: `{ "status": "stopped", "mode": null, "input_peak": 0, "output_peak": 0, "packets_lost": 0, "buffer_ms": 0, "error": null }`.
-- `GET /api/settings`: saved Settings.
-- `PUT /api/settings`: complete Settings; returns validated saved Settings. Reject changes while a session is active.
-- `POST /api/start`: no settings payload; uses saved Settings; returns State.
-- `POST /api/stop`: idempotent; returns State after workers stop.
-- `GET /api/bootstrap`: `{ "csrf_token": "per-launch-random-value" }`, for same-origin UI initialization.
+HTTP binds `127.0.0.1:46001` only. `GET /api/devices` returns `Devices`; `GET /api/state` returns `State`; `GET /api/settings` returns saved `Settings`; `PUT /api/settings` accepts complete `Settings` and returns validated saved `Settings`; `POST /api/start` accepts no settings payload, uses saved settings and returns `State`; `POST /api/stop` is idempotent and returns `State`; `GET /api/bootstrap` returns `Bootstrap { csrf_token: per-launch-random-value }` with no caching. `ErrorResponse { error: ApiError { code, message } }` is used on failure:
 
-State statuses: `stopped`, `starting`, `listening`, `receiving`, `sending`, `stopping`, `failed`. Peaks are finite values 0–1; unavailable measurements are zero. `sending` means local emission, not confirmed remote reception. Task 02 fixes counter lifetime, state transitions, timeouts, and structured error codes.
+| HTTP | `code` | Meaning |
+| --- | --- | --- |
+| 400 | `invalid_request` | Malformed/oversized JSON or wrong request shape |
+| 400 | `invalid_settings` | Unsupported/invalid settings or missing Start prerequisites |
+| 409 | `lifecycle_conflict` | Already active, failed-not-stopped, or active settings mutation |
+| 503 | `device_unavailable`, `backend_unavailable` | Selected endpoint absent/inactive; backend unsupported or stub |
+| 500 | `worker_failed`, `internal_error` | Running worker failure, persistence/other unexpected failure |
 
-Errors: `{ "error": { "code": "invalid_settings", "message": "human-readable explanation" } }`; use 400 for invalid input, 409 for lifecycle conflicts, 503 for unavailable devices/backends, 500 for unexpected failures. Device errors must not silently select a different endpoint.
+Do not erase corrupt settings on read failure. Host validation applies to all requests; validate Origin where supplied, require expected Origin for browser mutations, and require `X-Audioportal-Token` on mutations. No wildcard CORS; task 09 specifies the development proxy allowlist without weakening release rules. Error responses are structured even when no session started.
 
-HTTP default: `127.0.0.1:46001`; no LAN listener. Validate Host on all requests; validate Origin where supplied, require expected Origin for browser mutations, and require `X-Audioportal-Token` on mutations. Bootstrap responses are not cacheable. No wildcard CORS. Task 09 specifies the development proxy allowlist without loosening release rules.
+## Fixtures, verification and unresolved product decisions
 
-## Build and verification
+Example responses: `specs/fixtures/devices.json`, `settings.json`, `state-stopped.json`, `state-receiving.json`, `error.json`. Fixture round-trip tests check the shared Rust JSON shapes. Rust: `cargo fmt --check`, `cargo check`, focused `cargo test`; UI once present: `npm ci`, `npm run check`, `npm run build`. Release embeds `ui/dist/`, Node is build-time only. Leave focused checks for parsing, buffering, lifecycle, drift, persistence and HTTP security in their owning tasks.
 
-- Rust: `cargo fmt --check`, `cargo check`, and focused `cargo test` checks.
-- UI: `npm ci`, `npm run check`, `npm run build`, using the committed lockfile.
-- Vite dev server proxies `/api` to Rust. Release embeds `ui/dist/` assets; Node is build-time only.
-- Windows audio checks require real Windows hardware. Linux pure-logic checks or cross-compilation do not count as hardware validation.
-- Leave a small runnable check for packet parsing, buffering, lifecycle, drift, persistence, and web security behavior. Prefer focused tests over duplicated per-function suites.
+No additional user product decision blocks tasks 03–10. Product targets still to confirm on actual machines before release: end-to-end latency (provisional under 100 ms on wired LAN), Windows versions/architectures, and video lip-sync acceptability. Hardware follow-ups from the spike: audible 44.1 kHz playback quality, disconnect/stop during streaming, and whether the adjustable playback ratio can be implemented satisfactorily on real hardware. Linux tests and cross-compilation are not hardware validation.
