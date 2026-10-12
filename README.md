@@ -23,4 +23,11 @@ cargo build
 cargo run
 ```
 
-The executable currently starts and exits. Audio backend and device behavior will be investigated separately on Windows with real audio hardware; Linux builds and checks are not evidence of hardware validation.
+The main executable currently starts and exits. To list active Windows audio endpoints and exercise a ten-second capture/playback path, use a Developer PowerShell from the repository root:
+
+```powershell
+cargo run --example audio_probe -- list
+cargo run --example audio_probe -- run '<CABLE Output capture ID>' '<headphones playback ID>'
+```
+
+Use the full IDs printed by `list`, including braces. Route a browser/player to **CABLE Input** in Windows audio settings; select its paired **CABLE Output** as the capture ID and headphones/speakers as playback. Start local audio on the selected headphones independently to check shared-mode mixing. Never select CABLE Input as the probe's playback device: that would feed the cable back into itself. The `peak` line reports captured sample activity; `0.000` means no audible signal was measured. The probe exits after ten seconds. See `specs/audio-spike-results.md` for observed results and remaining manual checks.
