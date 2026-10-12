@@ -1,5 +1,6 @@
 # Build output and installed frontend dependencies
 /target/
+/settings.json
 /ui/node_modules/
 /ui/dist/
 
