@@ -4,6 +4,12 @@ Dependencies: 02.
 
 Task 09 is optional for live API verification; fixtures allow independent implementation.
 
+## Complexity and model guidance
+
+- **Estimated complexity:** Medium.
+- **Suggested model:** Standard; **reasoning effort:** Medium.
+- A single conventional page with frozen API fixtures. Most complexity is async state: polling cleanup, preserving edits, token refresh, and save-before-start behavior, rather than visual layout.
+
 ## Goal
 
 Build the single-page, client-rendered configuration experience against the frozen HTTP contract.

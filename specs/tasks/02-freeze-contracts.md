@@ -2,6 +2,12 @@
 
 Dependencies: 01, including the Windows feasibility check.
 
+## Complexity and model guidance
+
+- **Estimated complexity:** High.
+- **Suggested model:** Strong; **reasoning effort:** High.
+- Decisions connect audio ownership, transport timing, lifecycle, and HTTP/UI state. Mistakes propagate to every parallel lane, making this a high-value use of the strongest model.
+
 ## Goal
 
 Leave concrete interfaces that let audio, network, API, and UI agents work without inventing incompatible behavior.

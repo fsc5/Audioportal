@@ -2,6 +2,12 @@
 
 Dependencies: none.
 
+## Complexity and model guidance
+
+- **Estimated complexity:** Low.
+- **Suggested model:** Lightweight; **reasoning effort:** Low.
+- Conventional project setup with a narrow scope. The main check is correct Windows dependency gating, not architectural reasoning.
+
 ## Goal
 
 Create the smallest buildable foundation for the audio spike and later application.

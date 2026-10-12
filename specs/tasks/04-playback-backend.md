@@ -2,6 +2,12 @@
 
 Dependencies: 02.
 
+## Complexity and model guidance
+
+- **Estimated complexity:** High.
+- **Suggested model:** Strong; **reasoning effort:** High.
+- Device callback timing, partial-block consumption, rate conversion, and smooth ratio changes are subtle. Real Windows playback checks are required.
+
 ## Goal
 
 Play bounded incoming audio through a selected Windows output alongside local apps.

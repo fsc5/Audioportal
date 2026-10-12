@@ -2,6 +2,12 @@
 
 Dependencies: 02.
 
+## Complexity and model guidance
+
+- **Estimated complexity:** Medium.
+- **Suggested model:** Standard; **reasoning effort:** Medium.
+- The format is fixed and pure tests provide strong feedback. Care is still needed for byte order, malformed lengths, signed samples, and wrapping sequence comparisons.
+
 ## Goal
 
 Implement the frozen packet format independently of sockets and Windows audio.

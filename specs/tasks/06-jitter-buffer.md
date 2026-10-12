@@ -2,6 +2,12 @@
 
 Dependencies: 05.
 
+## Complexity and model guidance
+
+- **Estimated complexity:** High.
+- **Suggested model:** Strong; **reasoning effort:** High.
+- Deadlines, ordering, wraparound, malicious timestamp gaps, and bounded resynchronization create interacting edge cases. Deterministic simulations are more useful than extra framework code.
+
 ## Goal
 
 Turn validated packets into a continuous, bounded audio timeline despite jitter, reordering, and loss.

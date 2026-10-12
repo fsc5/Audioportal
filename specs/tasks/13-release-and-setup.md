@@ -2,6 +2,12 @@
 
 Dependencies: 12, which includes completion of the UI/API/session tasks.
 
+## Complexity and model guidance
+
+- **Estimated complexity:** Medium.
+- **Suggested model:** Standard; **reasoning effort:** Medium.
+- Established asset embedding and build patterns should suffice. The tricky edges are build ordering, asset/JSON routing, and preserving release security rules. Standalone Windows execution must be checked.
+
 ## Goal
 
 Produce a standalone Windows executable serving the built Svelte UI, with reproducible setup instructions.

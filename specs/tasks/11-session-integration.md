@@ -2,6 +2,12 @@
 
 Dependencies: 03, 04, 07, 09, 10.
 
+## Complexity and model guidance
+
+- **Estimated complexity:** Very high.
+- **Suggested model:** Strong; **reasoning effort:** High.
+- Multiple worker lifecycles and API states must agree under startup failure, cancellation, and restart. Deadlock/resource-leak diagnosis makes this a priority for the strongest model. Two Windows PCs are required for completion.
+
 ## Goal
 
 Connect the existing modules into one owned session controllable from the browser.

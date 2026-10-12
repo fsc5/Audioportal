@@ -2,6 +2,12 @@
 
 Dependencies: 08.
 
+## Complexity and model guidance
+
+- **Estimated complexity:** High.
+- **Suggested model:** Strong; **reasoning effort:** High.
+- Endpoint plumbing is routine, but Host/Origin/token enforcement, development proxy behavior, and lifecycle conflicts need careful boundary reasoning. Request-level tests provide the key feedback.
+
 ## Goal
 
 Expose the frozen configuration/session API safely on loopback, ready for UI and later real audio integration.

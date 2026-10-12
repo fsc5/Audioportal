@@ -2,6 +2,12 @@
 
 Dependencies: 02.
 
+## Complexity and model guidance
+
+- **Estimated complexity:** High.
+- **Suggested model:** Strong; **reasoning effort:** High.
+- Native threading, sample conversion, discontinuities, bounded queues, and cancellation interact. The validated spike reduces uncertainty, but completion still requires Windows hardware checks.
+
 ## Goal
 
 Capture a selected Windows recording endpoint into bounded wire-rate audio blocks.

@@ -2,6 +2,12 @@
 
 Dependencies: 02.
 
+## Complexity and model guidance
+
+- **Estimated complexity:** Medium.
+- **Suggested model:** Standard; **reasoning effort:** Medium.
+- Mostly bounded validation and file handling. The main trap is assuming Unix replacement semantics on Windows or overwriting valid data on failure; Windows replacement verification is required.
+
 ## Goal
 
 Persist user configuration without accepting invalid settings or destroying existing files on failure.

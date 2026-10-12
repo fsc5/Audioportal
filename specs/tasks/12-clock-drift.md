@@ -2,6 +2,12 @@
 
 Dependencies: 11.
 
+## Complexity and model guidance
+
+- **Estimated complexity:** Very high.
+- **Suggested model:** Strong; **reasoning effort:** High.
+- Feedback control, occupancy accounting, resampling ratios, and jitter interact over long timelines. Prioritize the strongest model and deterministic simulation; completion also needs a one-hour two-PC soak.
+
 ## Goal
 
 Prevent independent device clocks from gradually emptying/filling buffers and increasing delay.

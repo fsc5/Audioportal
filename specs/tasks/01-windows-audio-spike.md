@@ -2,6 +2,12 @@
 
 Dependencies: 00.
 
+## Complexity and model guidance
+
+- **Estimated complexity:** High.
+- **Suggested model:** Strong; **reasoning effort:** High.
+- Unknown WASAPI/crate behavior, COM thread rules, format conversion, and device timing require investigation. Real Windows audio access is mandatory; model strength cannot substitute for it.
+
 ## Goal
 
 Prove that the intended device path works before other agents depend on it.

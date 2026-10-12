@@ -2,6 +2,12 @@
 
 Dependencies: 13.
 
+## Complexity and model guidance
+
+- **Estimated complexity:** High.
+- **Suggested model:** Strong; **reasoning effort:** High for measurement design and failure diagnosis. Standard/Medium is sufficient for routine checklist execution and recording results.
+- Requires distinguishing clock, device, network, and lifecycle failures using evidence. Two real Windows PCs and a human/device operator are the limiting resources; extra reasoning cannot replace measurements.
+
 ## Goal
 
 Establish what the release actually supports and whether it meets the original laptop/video plus gaming-PC use case.

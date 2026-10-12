@@ -2,6 +2,12 @@
 
 Dependencies: 06.
 
+## Complexity and model guidance
+
+- **Estimated complexity:** High.
+- **Suggested model:** Strong; **reasoning effort:** High.
+- Socket I/O is straightforward; cancellation, session learning/reset, playout ownership, and backpressure are the difficult parts. Localhost checks can validate this task without Windows audio devices.
+
 ## Goal
 
 Exchange bounded audio streams between configured peers, without owning audio devices or the web API.
