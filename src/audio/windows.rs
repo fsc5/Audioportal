@@ -1,6 +1,9 @@
 use std::error::Error;
 use wasapi::{Device, DeviceEnumerator, DeviceState, Direction, ShareMode, WaveFormat};
 
+pub mod capture;
+pub use capture::start_capture;
+
 pub type AudioResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 #[derive(Debug)]
