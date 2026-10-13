@@ -83,7 +83,7 @@ impl WorkerHandle {
         self.thread.join().unwrap_or_else(|_| {
             Err(ApiError {
                 code: crate::contracts::ErrorCode::WorkerFailed,
-                message: "audio worker panicked".into(),
+                message: "worker panicked".into(),
             })
         })
     }
