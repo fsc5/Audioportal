@@ -588,7 +588,9 @@ mod tests {
 
     #[test]
     fn receiver_reports_port_conflict() {
-        let occupied = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        // Match the receiver's wildcard bind; Windows permits some distinct
+        // specific-address/wildcard bindings to coexist on the same port.
+        let occupied = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).unwrap();
         let port = occupied.local_addr().unwrap().port();
         let error = start_receiver(
             Ipv4Addr::LOCALHOST,

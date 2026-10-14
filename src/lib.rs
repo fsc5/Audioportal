@@ -2,9 +2,7 @@ pub mod audio;
 pub mod contracts;
 pub mod jitter;
 pub mod protocol;
-#[cfg(feature = "dev-api")]
 pub mod session;
 pub mod settings;
 pub mod transport;
-#[cfg(feature = "dev-api")]
 pub mod web;

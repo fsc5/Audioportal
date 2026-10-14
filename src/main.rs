@@ -9,17 +9,19 @@ async fn main() -> std::process::ExitCode {
             development_proxy = true;
         }
         let path = audioportal::settings::settings_path().map_err(|error| error.message)?;
-        let app =
-            audioportal::web::router(path, development_proxy).map_err(|error| error.message)?;
         let listener = audioportal::web::bind()
             .await
             .map_err(|error| error.message)?;
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = tokio::signal::ctrl_c().await;
-            })
-            .await
-            .map_err(|error| format!("HTTP server failed: {error}"))
+        let session = std::sync::Arc::new(std::sync::Mutex::new(
+            audioportal::session::SessionController::default(),
+        ));
+        let app = audioportal::web::router_with_session(path, development_proxy, session.clone())
+            .map_err(|error| error.message)?;
+        audioportal::web::serve(listener, app, session, async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await
+        .map_err(|error| error.message)
     }
     .await;
     match result {

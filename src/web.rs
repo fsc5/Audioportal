@@ -1,6 +1,8 @@
-//! Loopback HTTP boundary. Enabled explicitly with the development controller.
+//! Loopback HTTP boundary for the owned audio session.
+use std::future::{Future, IntoFuture};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State};
@@ -52,7 +54,55 @@ pub async fn bind() -> Result<tokio::net::TcpListener, ApiError> {
     })
 }
 
+/// Stop session workers independently of HTTP draining. Request tasks may
+/// outlive the drain deadline, so shutdown also permanently rejects Start/Save.
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    session: Arc<Mutex<SessionController>>,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), ApiError> {
+    let (signal, received) = tokio::sync::oneshot::channel::<()>();
+    let serving = axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = received.await;
+        })
+        .into_future();
+    tokio::pin!(serving);
+    let served = tokio::select! {
+        result = &mut serving => Some(result),
+        () = shutdown => None,
+    };
+    let _ = signal.send(());
+    let stopped = blocking(move || session.lock().map_err(|_| poisoned())?.shutdown()).await;
+    let served = match served {
+        Some(result) => result,
+        None => tokio::time::timeout(Duration::from_secs(1), &mut serving)
+            .await
+            .unwrap_or(Ok(())),
+    };
+    let _ = stopped?;
+    served.map_err(|cause| {
+        error(
+            ErrorCode::InternalError,
+            format!("HTTP server failed: {cause}"),
+        )
+    })
+}
+
 pub fn router(path: PathBuf, development_proxy: bool) -> Result<Router, ApiError> {
+    router_with_session(
+        path,
+        development_proxy,
+        Arc::new(Mutex::new(SessionController::default())),
+    )
+}
+
+pub fn router_with_session(
+    path: PathBuf,
+    development_proxy: bool,
+    session: Arc<Mutex<SessionController>>,
+) -> Result<Router, ApiError> {
     let mut bytes = [0; 32];
     getrandom::fill(&mut bytes).map_err(|_| {
         error(
@@ -62,7 +112,7 @@ pub fn router(path: PathBuf, development_proxy: bool) -> Result<Router, ApiError
     })?;
     let token = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
     Ok(routes(Context {
-        session: Arc::new(Mutex::new(SessionController::default())),
+        session,
         path,
         token,
         development_proxy,
@@ -362,7 +412,11 @@ mod tests {
             &app,
             request("POST", "/api/start", ""),
             StatusCode::SERVICE_UNAVAILABLE,
-            ErrorCode::BackendUnavailable,
+            if cfg!(windows) {
+                ErrorCode::DeviceUnavailable
+            } else {
+                ErrorCode::BackendUnavailable
+            },
         )
         .await;
         assert_eq!(
@@ -377,7 +431,7 @@ mod tests {
             Status::Stopping,
             Status::Failed,
         ] {
-            context.session.lock().unwrap().state.status = status;
+            context.session.lock().unwrap().set_test_status(status);
             for (method, path, body) in
                 [("PUT", "/api/settings", saved), ("POST", "/api/start", "")]
             {
@@ -648,6 +702,245 @@ mod tests {
         release_tx.send(()).unwrap();
         holder.join().unwrap();
         assert_eq!(waiting.await.unwrap().unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_workers_with_stalled_bodies_and_rejects_delayed_start() {
+        use crate::audio::WorkerHandle;
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let directory = tempfile::tempdir().unwrap();
+        let context = test_context(directory.path().join("settings.json"), false);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel = cancelled.clone();
+        let (exited_tx, exited_rx) = tokio::sync::oneshot::channel();
+        let (_errors_tx, errors) = std::sync::mpsc::sync_channel(1);
+        context
+            .session
+            .lock()
+            .unwrap()
+            .start_test_worker(WorkerHandle {
+                cancelled: cancelled.clone(),
+                errors,
+                thread: std::thread::spawn(move || {
+                    while !cancel.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    let _ = exited_tx.send(());
+                    Ok(())
+                }),
+            });
+
+        // Observe headers reaching middleware before requesting shutdown.
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel(2);
+        let app =
+            routes(context.clone()).layer(middleware::from_fn(move |req: Request, next: Next| {
+                let entered = entered_tx.clone();
+                async move {
+                    entered.try_send(()).unwrap();
+                    next.run(req).await
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(serve(listener, app, context.session.clone(), async {
+            shutdown_rx.await.unwrap();
+        }));
+        let (stalled, mut delayed_start) = tokio::task::spawn_blocking(move || {
+            let mut stalled = TcpStream::connect(address).unwrap();
+            stalled.write_all(format!("GET /api/state HTTP/1.1\r\nHost: {ADDRESS}\r\nContent-Length: 1\r\n\r\n").as_bytes()).unwrap();
+            let mut delayed = TcpStream::connect(address).unwrap();
+            delayed.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            delayed.write_all(format!("POST /api/start HTTP/1.1\r\nHost: {ADDRESS}\r\nOrigin: http://{ADDRESS}\r\nX-Audioportal-Token: test-token\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
+            (stalled, delayed)
+        }).await.unwrap();
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(3), entered_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), exited_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), serving)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(cancelled.load(Ordering::Acquire));
+        assert_eq!(
+            context.session.lock().unwrap().snapshot().status,
+            Status::Stopped
+        );
+        // Normal Stop must not reopen the application for queued mutations.
+        context.session.lock().unwrap().stop().unwrap();
+        let response = tokio::task::spawn_blocking(move || {
+            delayed_start.write_all(b"0\r\n\r\n").unwrap();
+            let mut response = String::new();
+            delayed_start.read_to_string(&mut response).unwrap();
+            response
+        })
+        .await
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+        assert!(response.contains("shutting down"), "{response}");
+        drop(stalled);
+        rejected(
+            &routes(context),
+            request(
+                "PUT",
+                "/api/settings",
+                serde_json::to_vec(&Settings::default()).unwrap(),
+            ),
+            StatusCode::CONFLICT,
+            ErrorCode::LifecycleConflict,
+        )
+        .await;
+    }
+
+    /// Explicit IDs avoid selecting or playing through an unintended endpoint.
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "requires AUDIOPORTAL_TEST_CAPTURE_ID and AUDIOPORTAL_TEST_PLAYBACK_ID on Windows"]
+    async fn native_session_api_round_trip() {
+        use crate::contracts::Mode;
+        use std::net::UdpSocket;
+        use std::time::Duration;
+
+        async fn wait_status(app: &Router, expected: &str) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let (_, state) = send(app, request("GET", "/api/state", "")).await;
+                    assert_ne!(state["status"], "failed", "{state}");
+                    if state["status"] == expected {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        let capture =
+            std::env::var("AUDIOPORTAL_TEST_CAPTURE_ID").expect("explicit capture ID required");
+        let playback =
+            std::env::var("AUDIOPORTAL_TEST_PLAYBACK_ID").expect("explicit playback ID required");
+        let directory = tempfile::tempdir().unwrap();
+        let first = test_context(directory.path().join("first.json"), false);
+        let second = test_context(directory.path().join("second.json"), false);
+        let first_app = routes(first.clone());
+        let second_app = routes(second.clone());
+        let occupied = UdpSocket::bind("0.0.0.0:0").unwrap();
+        let config = Settings {
+            mode: Mode::Receive,
+            capture_device_id: Some(capture),
+            playback_device_id: Some(playback),
+            peer_ip: "127.0.0.1".into(),
+            udp_port: occupied.local_addr().unwrap().port(),
+            ..Settings::default()
+        };
+        for id in [
+            "missing".to_owned(),
+            config.capture_device_id.clone().unwrap(),
+        ] {
+            let bad = Settings {
+                playback_device_id: Some(id),
+                ..config.clone()
+            };
+            settings::save(&first.path, &bad).unwrap();
+            rejected(
+                &first_app,
+                request("POST", "/api/start", ""),
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::DeviceUnavailable,
+            )
+            .await;
+            assert_eq!(
+                first.session.lock().unwrap().snapshot().status,
+                Status::Stopped
+            );
+        }
+        settings::save(&first.path, &config).unwrap();
+        rejected(
+            &first_app,
+            request("POST", "/api/start", ""),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::WorkerFailed,
+        )
+        .await;
+        assert_eq!(
+            first.session.lock().unwrap().snapshot().status,
+            Status::Failed
+        );
+        assert_eq!(
+            send(&first_app, request("POST", "/api/stop", "")).await.0,
+            StatusCode::OK
+        );
+        drop(occupied);
+
+        // Swap roles on the two API contexts; each owns real WASAPI/UDP workers.
+        for (receiver, receiver_context, sender, sender_context) in [
+            (&first_app, &first, &second_app, &second),
+            (&second_app, &second, &first_app, &first),
+        ] {
+            settings::save(&receiver_context.path, &config).unwrap();
+            settings::save(
+                &sender_context.path,
+                &Settings {
+                    mode: Mode::Send,
+                    ..config.clone()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                send(receiver, request("POST", "/api/start", "")).await.0,
+                StatusCode::OK
+            );
+            wait_status(receiver, "listening").await;
+            for _ in 0..2 {
+                assert_eq!(
+                    send(sender, request("POST", "/api/start", "")).await.0,
+                    StatusCode::OK
+                );
+                wait_status(sender, "sending").await;
+                wait_status(receiver, "receiving").await;
+                rejected(
+                    sender,
+                    request("POST", "/api/start", ""),
+                    StatusCode::CONFLICT,
+                    ErrorCode::LifecycleConflict,
+                )
+                .await;
+                rejected(
+                    receiver,
+                    request("PUT", "/api/settings", serde_json::to_vec(&config).unwrap()),
+                    StatusCode::CONFLICT,
+                    ErrorCode::LifecycleConflict,
+                )
+                .await;
+                assert_eq!(
+                    send(sender, request("POST", "/api/stop", "")).await.0,
+                    StatusCode::OK
+                );
+                wait_status(receiver, "listening").await;
+            }
+            for app in [receiver, sender] {
+                for _ in 0..2 {
+                    let (status, state) = send(app, request("POST", "/api/stop", "")).await;
+                    assert_eq!(status, StatusCode::OK);
+                    assert_eq!(state["status"], "stopped");
+                    assert_eq!(state["input_peak"], 0.0);
+                    assert_eq!(state["output_peak"], 0.0);
+                }
+            }
+        }
     }
 
     #[test]

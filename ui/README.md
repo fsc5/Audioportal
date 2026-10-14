@@ -18,18 +18,18 @@ with no Node server, component library, router, or testing framework at runtime.
 From the repository root:
 
 ```sh
-cargo run --features dev-api -- --dev-proxy
+cargo run -- --dev-proxy
 ```
 
 In another terminal, from `ui/`, run `npm run dev` and open
 `http://127.0.0.1:5173`. The strict-port proxy preserves Host and Origin.
-The current development backend returns `503 backend_unavailable` on Start.
-Linux also returns that error for device enumeration; Windows supplies real
-devices. Neither the UI nor its production build simulates audio success.
+Windows supplies real devices and starts the selected audio/UDP pipeline.
+Linux returns `503 backend_unavailable` for device enumeration and otherwise
+valid Start requests. Neither the UI nor its production build simulates audio success.
 
 Client fixture checks are in `tests/client.test.ts`, using `specs/fixtures/`.
-There are no application mock removal points. Task 11 replaces the Rust
-development controller, as described in `specs/local-http-api.md`.
+There are no application mock removal points. Task 11 integration and hardware
+verification steps are recorded in `specs/session-results.md`.
 
 ## Browser verification
 
@@ -56,5 +56,5 @@ The test starts/stops Vite itself and serves API fixtures only in the test brows
   unavailable counters, not the previous successful stream state.
 - Restart the API and attempt a mutation: the failed request refreshes bootstrap
   once, reports the error, and requires an explicit retry (no automatic replay).
-- Through the proxy verify bootstrap, Save, Start's expected development error,
-  state polling, and idempotent Stop. Real streaming requires Task 11 and Windows.
+- Through the proxy verify bootstrap, Save, Start, state polling, API errors,
+  and idempotent Stop. Real streaming requires Windows audio devices.

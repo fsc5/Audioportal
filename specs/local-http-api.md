@@ -1,5 +1,10 @@
 # Task 09: local HTTP API handoff
 
+Historical Task 09 handoff: Task 11 replaces the stub and removes the `dev-api`
+feature. Current commands and verification: `session-results.md`. Use
+`cargo run -- --dev-proxy` for UI development and `cargo test --locked web::tests`
+for HTTP regression checks. The browser boundary below still applies.
+
 Run `cargo run --features dev-api` for the control API at `http://127.0.0.1:46001`.
 The `dev-api` feature explicitly includes the development-only controller and
 binary. Default builds do not include this stub. Start returns
