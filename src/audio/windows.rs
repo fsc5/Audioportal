@@ -3,6 +3,8 @@ use wasapi::{Device, DeviceEnumerator, DeviceState, Direction, ShareMode, WaveFo
 
 pub mod capture;
 pub use capture::start_capture;
+pub mod playback;
+pub use playback::start_playback;
 
 pub type AudioResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 

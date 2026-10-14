@@ -1,7 +1,7 @@
 //! Shared, platform-independent audio values. Windows endpoints stay in `windows`.
 use crate::contracts::ApiError;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -83,7 +83,7 @@ impl WorkerHandle {
         self.thread.join().unwrap_or_else(|_| {
             Err(ApiError {
                 code: crate::contracts::ErrorCode::WorkerFailed,
-                message: "audio worker panicked".into(),
+                message: "worker panicked".into(),
             })
         })
     }
@@ -100,6 +100,22 @@ pub struct PlaybackWorker {
     pub blocks: BlockQueue,
     pub output_peak: Arc<AtomicU32>, // f32 bits; finite, clamped to 0..=1
     pub ratio: ConsumptionRatio,
+    pub metrics: Arc<PlaybackMetrics>,
+}
+
+/// Independently sampled counters, not a coherent clock snapshot. All frame counts
+/// are stream-rate output frames except `missing_input_frames` (48 kHz) and
+/// `pending_input_frames` (unconsumed portion of a wire block).
+#[derive(Default)]
+pub struct PlaybackMetrics {
+    pub output_rate: AtomicU32,
+    pub submitted_frames: AtomicU64,
+    pub padding_frames: AtomicU32,
+    pub missing_input_frames: AtomicU64,
+    pub pending_input_frames: AtomicU32,
+    pub pending_output_frames: AtomicU32,
+    pub resampler_delay_frames: AtomicU32,
+    pub applied_ratio: AtomicU32, // f32 bits; ramp endpoint of the latest converted chunk
 }
 
 /// Input frames consumed per nominal output frame. 1.0 is uncorrected.
@@ -129,6 +145,9 @@ impl ConsumptionRatio {
 
 #[cfg(windows)]
 pub mod windows;
+
+#[cfg(any(windows, test))]
+mod playback;
 
 #[cfg(test)]
 mod tests {

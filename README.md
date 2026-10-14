@@ -23,7 +23,14 @@ cargo build
 cargo run
 ```
 
-The main executable currently starts and exits. To list active Windows audio endpoints and exercise a ten-second capture/playback path, use a Developer PowerShell from the repository root:
+The executable serves the control API on `127.0.0.1:46001`. For the browser UI,
+run `cargo run -- --dev-proxy`, then in a second terminal run `npm ci` and
+`npm run dev` from `ui/`. Open `http://127.0.0.1:5173`. Stop sessions in the UI;
+Ctrl+C also cancels and joins workers before the process exits. Static asset
+embedding belongs to Task 13. See `specs/session-results.md` for two-PC setup
+and current verification status.
+
+To list active Windows audio endpoints and exercise a ten-second capture/playback path, use a Developer PowerShell from the repository root:
 
 ```powershell
 cargo run --example audio_probe -- list
