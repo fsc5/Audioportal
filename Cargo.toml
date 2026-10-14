@@ -3,7 +3,17 @@ name = "audioportal"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+dev-api = []
+
+[[bin]]
+name = "audioportal"
+path = "src/main.rs"
+required-features = ["dev-api"]
+
 [dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
 dirs = "7"
 getrandom = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -11,6 +21,7 @@ serde_json = "1"
 tempfile = "3.27"
 
 [dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 rubato = { version = "5.0.1", default-features = false }
 audioadapter-buffers = "5.1"
 
