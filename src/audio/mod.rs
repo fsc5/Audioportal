@@ -149,6 +149,8 @@ pub mod windows;
 #[cfg(any(windows, test))]
 mod playback;
 
+pub mod drift;
+
 #[cfg(test)]
 mod tests {
     use super::*;

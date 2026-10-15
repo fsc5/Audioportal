@@ -289,6 +289,7 @@ fn build_pipeline(
                 settings.buffer_ms,
                 playback.blocks,
                 playback.ratio,
+                playback.metrics,
             )?;
             pipeline.receiver = Some(receiver.metrics);
             pipeline.workers.push(receiver.worker);
@@ -659,6 +660,7 @@ mod tests {
                         10,
                         BlockQueue::new(4),
                         ConsumptionRatio::default(),
+                        Arc::new(crate::audio::PlaybackMetrics::default()),
                     )?;
                     pipeline.workers.push(receiver.worker);
                     Ok(())
@@ -684,6 +686,7 @@ mod tests {
                             10,
                             queue.clone(),
                             ConsumptionRatio::default(),
+                            Arc::new(crate::audio::PlaybackMetrics::default()),
                         )?;
                         local_port = receiver.local_addr.port();
                         pipeline.receiver = Some(receiver.metrics);

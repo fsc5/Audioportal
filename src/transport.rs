@@ -1,5 +1,6 @@
 //! Bounded UDP sender and receiver workers.
-use crate::audio::{BlockQueue, ConsumptionRatio, WorkerHandle, FRAMES_PER_BLOCK};
+use crate::audio::drift::{frames_duration, occupancy_frames, DriftController};
+use crate::audio::{BlockQueue, ConsumptionRatio, PlaybackMetrics, WorkerHandle, FRAMES_PER_BLOCK};
 use crate::contracts::{ApiError, ErrorCode, Status};
 use crate::jitter::JitterBuffer;
 use crate::protocol::{decode, encode, Packet, PACKET_LEN};
@@ -37,6 +38,8 @@ pub struct ReceiverMetrics {
     packets_lost: AtomicU64,
     occupancy: AtomicUsize,
     local_skipped_blocks: AtomicU64,
+    queue_evicted_blocks: AtomicU64,
+    total_frames: AtomicU64, // f64 bits; 48 kHz frames, including playback/device buffers
 }
 
 impl ReceiverMetrics {
@@ -58,6 +61,14 @@ impl ReceiverMetrics {
 
     pub fn local_skipped_blocks(&self) -> u64 {
         self.local_skipped_blocks.load(Ordering::Relaxed)
+    }
+
+    pub fn queue_evicted_blocks(&self) -> u64 {
+        self.queue_evicted_blocks.load(Ordering::Relaxed)
+    }
+
+    pub fn total_frames(&self) -> f64 {
+        f64::from_bits(self.total_frames.load(Ordering::Relaxed))
     }
 }
 
@@ -125,6 +136,7 @@ pub fn start_receiver(
     buffer_ms: u16,
     blocks: BlockQueue,
     ratio: ConsumptionRatio,
+    playback: Arc<PlaybackMetrics>,
 ) -> Result<ReceiverWorker, ApiError> {
     let jitter = JitterBuffer::new(buffer_ms)?;
     let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))
@@ -142,15 +154,18 @@ pub fn start_receiver(
         packets_lost: AtomicU64::new(0),
         occupancy: AtomicUsize::new(0),
         local_skipped_blocks: AtomicU64::new(0),
+        queue_evicted_blocks: AtomicU64::new(0),
+        total_frames: AtomicU64::new(0f64.to_bits()),
     });
     let thread_metrics = metrics.clone();
     let worker = spawn_worker("audioportal-udp-receiver", move |cancelled| {
+        let state = ReceiveState::new(peer_ip, jitter, buffer_ms);
         let result = run_receiver(
             socket,
-            peer_ip,
             blocks,
             ratio,
-            jitter,
+            playback,
+            state,
             &thread_metrics,
             &cancelled,
         );
@@ -217,9 +232,41 @@ struct ReceiveState {
     active_session: Option<u64>,
     last_accepted: Option<Instant>,
     jitter: JitterBuffer,
+    target_ms: u16,
+    first_packet: Option<Instant>,
+    media_clock: Option<(Instant, Instant)>, // real sample time, virtual playout time
+    playout_control: DriftController,
+    playback_control: DriftController,
+    queue_evicted_blocks: u64,
 }
 
 impl ReceiveState {
+    fn new(peer_ip: Ipv4Addr, jitter: JitterBuffer, target_ms: u16) -> Self {
+        Self {
+            peer_ip,
+            active_session: None,
+            last_accepted: None,
+            jitter,
+            target_ms,
+            first_packet: None,
+            media_clock: None,
+            // The release phase oscillates around the target by half a block.
+            playout_control: DriftController::new(target_ms as usize * 48 - FRAMES_PER_BLOCK / 2),
+            // Leave two blocks after the jitter stage for callback phase variation.
+            playback_control: DriftController::new(target_ms as usize * 48 + 2 * FRAMES_PER_BLOCK),
+            queue_evicted_blocks: 0,
+        }
+    }
+
+    fn media_now(&mut self, now: Instant) -> Instant {
+        let (previous, media) = self.media_clock.unwrap_or((now, now));
+        let seconds = now.saturating_duration_since(previous).as_secs_f64();
+        let advanced = Duration::from_secs_f64(seconds * self.playout_control.ratio() as f64);
+        let media = media.checked_add(advanced).unwrap_or(now);
+        self.media_clock = Some((now, media));
+        media
+    }
+
     fn expire(&mut self, now: Instant, blocks: &BlockQueue, ratio: &ConsumptionRatio) -> bool {
         if !self
             .last_accepted
@@ -230,6 +277,10 @@ impl ReceiveState {
         self.active_session = None;
         self.last_accepted = None;
         self.jitter.reset();
+        self.first_packet = None;
+        self.media_clock = None;
+        self.playout_control.reset();
+        self.playback_control.reset();
         while blocks.pop().is_some() {}
         ratio.set(1.0).expect("1.0 is a valid consumption ratio");
         true
@@ -248,8 +299,12 @@ impl ReceiveState {
         {
             return false;
         }
-        if !self.jitter.insert(packet.block, now) {
+        let media = self.media_now(now);
+        if !self.jitter.insert(packet.block, media) {
             return false;
+        }
+        if self.active_session.is_none() {
+            self.first_packet = Some(now);
         }
         self.active_session = Some(packet.session_id);
         self.last_accepted = Some(now);
@@ -258,44 +313,83 @@ impl ReceiveState {
 
     fn playout(&mut self, now: Instant, blocks: &BlockQueue) -> u64 {
         let mut lost = 0u64;
-        while let Some((block, silence)) = self.jitter.poll(now) {
-            blocks.push(block);
+        let media = self.media_now(now);
+        while let Some((block, silence)) = self.jitter.poll(media) {
+            self.queue_evicted_blocks = self
+                .queue_evicted_blocks
+                .saturating_add(u64::from(blocks.push(block)));
             lost += u64::from(silence);
         }
         lost
+    }
+
+    fn correct(
+        &mut self,
+        now: Instant,
+        blocks: &BlockQueue,
+        ratio: &ConsumptionRatio,
+        playback: &PlaybackMetrics,
+    ) -> Option<f64> {
+        if !self.first_packet.is_some_and(|first| {
+            now.saturating_duration_since(first)
+                >= Duration::from_millis(u64::from(self.target_ms) + 200)
+        }) {
+            return None;
+        }
+        let lead = self.jitter.occupancy();
+        self.playout_control
+            .update((lead * FRAMES_PER_BLOCK) as f64, now);
+        let total = occupancy_frames(lead, blocks.len(), playback)?;
+        // Filter and device padding are in the measured total, but constitute
+        // fixed downstream latency; feedback must not try to drain the device.
+        let rate = playback.output_rate.load(Ordering::Relaxed) as f64;
+        let fixed = (playback.padding_frames.load(Ordering::Relaxed) as f64
+            + playback.resampler_delay_frames.load(Ordering::Relaxed) as f64)
+            * 48_000.
+            / rate;
+        ratio
+            .set(self.playback_control.update(total - fixed, now))
+            .expect("controller ratio is within the consumption ratio bounds");
+        Some(total)
     }
 }
 
 fn run_receiver(
     socket: UdpSocket,
-    peer_ip: Ipv4Addr,
     blocks: BlockQueue,
     ratio: ConsumptionRatio,
-    jitter: JitterBuffer,
+    playback: Arc<PlaybackMetrics>,
+    mut state: ReceiveState,
     metrics: &ReceiverMetrics,
     cancelled: &AtomicBool,
 ) -> Result<(), ApiError> {
-    let mut state = ReceiveState {
-        peer_ip,
-        active_session: None,
-        last_accepted: None,
-        jitter,
-    };
     // A full UDP payload buffer prevents oversized datagrams from becoming
     // WSAEMSGSIZE worker failures on Windows; decode rejects non-exact lengths.
     let mut bytes = vec![0; u16::MAX as usize];
+    let mut last_report = Instant::now();
+    let mut skipped_before_reset = 0u64;
     while !cancelled.load(Ordering::Acquire) {
         let mut now = Instant::now();
+        let skipped = state.jitter.local_skipped_blocks();
         if state.expire(now, &blocks, &ratio) {
+            skipped_before_reset = skipped_before_reset.saturating_add(skipped);
             metrics.receiving.store(false, Ordering::Relaxed);
+            metrics
+                .total_frames
+                .store(0f64.to_bits(), Ordering::Relaxed);
         }
 
         for _ in 0..DATAGRAMS_PER_TICK {
             match socket.recv_from(&mut bytes) {
                 Ok((length, source)) => {
                     now = Instant::now();
+                    let skipped = state.jitter.local_skipped_blocks();
                     if state.expire(now, &blocks, &ratio) {
+                        skipped_before_reset = skipped_before_reset.saturating_add(skipped);
                         metrics.receiving.store(false, Ordering::Relaxed);
+                        metrics
+                            .total_frames
+                            .store(0f64.to_bits(), Ordering::Relaxed);
                     }
                     if state.accept(source, &bytes[..length], now) {
                         metrics.receiving.store(true, Ordering::Relaxed);
@@ -310,18 +404,49 @@ fn run_receiver(
         }
 
         now = Instant::now();
+        let skipped = state.jitter.local_skipped_blocks();
         if state.expire(now, &blocks, &ratio) {
+            skipped_before_reset = skipped_before_reset.saturating_add(skipped);
             metrics.receiving.store(false, Ordering::Relaxed);
+            metrics
+                .total_frames
+                .store(0f64.to_bits(), Ordering::Relaxed);
         } else {
             let lost = state.playout(now, &blocks);
             metrics.packets_lost.fetch_add(lost, Ordering::Relaxed);
+            if let Some(total) = state.correct(now, &blocks, &ratio, &playback) {
+                metrics
+                    .total_frames
+                    .store(total.to_bits(), Ordering::Relaxed);
+            }
         }
         metrics
             .occupancy
             .store(state.jitter.occupancy(), Ordering::Relaxed);
+        metrics.local_skipped_blocks.store(
+            skipped_before_reset.saturating_add(state.jitter.local_skipped_blocks()),
+            Ordering::Relaxed,
+        );
         metrics
-            .local_skipped_blocks
-            .store(state.jitter.local_skipped_blocks(), Ordering::Relaxed);
+            .queue_evicted_blocks
+            .store(state.queue_evicted_blocks, Ordering::Relaxed);
+        if now.saturating_duration_since(last_report) >= Duration::from_secs(10) {
+            last_report = now;
+            if state.active_session.is_some() {
+                let total = metrics.total_frames();
+                eprintln!(
+                    "receive: jitter={} blocks total={:.1} ms ratio={:.6} playout={:.6} missing_input={} lost={} skipped={} queue_evicted={}",
+                    metrics.occupancy(),
+                    frames_duration(total).as_secs_f64() * 1_000.,
+                    ratio.get(),
+                    state.playout_control.ratio(),
+                    playback.missing_input_frames.load(Ordering::Relaxed),
+                    metrics.packets_lost(),
+                    metrics.local_skipped_blocks(),
+                    metrics.queue_evicted_blocks(),
+                );
+            }
+        }
         thread::sleep(POLL_INTERVAL);
     }
     Ok(())
@@ -376,6 +501,7 @@ mod tests {
     use crate::audio::{
         AudioBlock, CAPTURE_QUEUE_BLOCKS, PLAYBACK_QUEUE_BLOCKS, SAMPLES_PER_BLOCK,
     };
+    use std::sync::atomic::AtomicU32;
 
     fn packet(session_id: u64, slot: u64) -> [u8; PACKET_LEN] {
         encode(&Packet {
@@ -389,12 +515,7 @@ mod tests {
     }
 
     fn state(peer_ip: Ipv4Addr, buffer_ms: u16) -> ReceiveState {
-        ReceiveState {
-            peer_ip,
-            active_session: None,
-            last_accepted: None,
-            jitter: JitterBuffer::new(buffer_ms).unwrap(),
-        }
+        ReceiveState::new(peer_ip, JitterBuffer::new(buffer_ms).unwrap(), buffer_ms)
     }
 
     fn source(ip: Ipv4Addr) -> SocketAddr {
@@ -432,10 +553,26 @@ mod tests {
             samples: [0; SAMPLES_PER_BLOCK],
         });
         ratio.set(1.001).unwrap();
+        receive
+            .playout_control
+            .update(2_000., start + Duration::from_millis(10));
+        receive
+            .playout_control
+            .update(2_000., start + Duration::from_millis(20));
+        receive
+            .playback_control
+            .update(2_000., start + Duration::from_millis(10));
+        receive
+            .playback_control
+            .update(2_000., start + Duration::from_millis(20));
+        assert!(receive.playout_control.ratio() > 1.);
+        assert!(receive.playback_control.ratio() > 1.);
         assert!(receive.expire(start + SESSION_IDLE_TIMEOUT, &blocks, &ratio));
         assert_eq!(receive.active_session, None);
         assert!(blocks.is_empty());
         assert_eq!(ratio.get(), 1.0);
+        assert_eq!(receive.playout_control.ratio(), 1.0);
+        assert_eq!(receive.playback_control.ratio(), 1.0);
         assert!(receive.accept(source(peer), &packet(2, 100), start + SESSION_IDLE_TIMEOUT));
     }
 
@@ -457,11 +594,13 @@ mod tests {
         );
         assert_eq!(blocks.len(), PLAYBACK_QUEUE_BLOCKS);
         assert_eq!(receive.jitter.local_skipped_blocks(), 0);
+        assert_eq!(receive.queue_evicted_blocks, 1);
         assert_eq!(
             receive.playout(start + Duration::from_millis(35), &blocks),
             1
         );
         assert_eq!(blocks.len(), PLAYBACK_QUEUE_BLOCKS);
+        assert_eq!(receive.queue_evicted_blocks, 2);
         for _ in 1..PLAYBACK_QUEUE_BLOCKS {
             blocks.pop().unwrap();
         }
@@ -479,6 +618,7 @@ mod tests {
             10,
             playback.clone(),
             ConsumptionRatio::default(),
+            Arc::new(PlaybackMetrics::default()),
         )
         .unwrap();
         let port = receiver.local_addr.port();
@@ -517,6 +657,7 @@ mod tests {
             10,
             restarted_playback.clone(),
             ConsumptionRatio::default(),
+            Arc::new(PlaybackMetrics::default()),
         )
         .unwrap();
         let after_restart = AudioBlock {
@@ -544,23 +685,32 @@ mod tests {
             10,
             playback,
             ConsumptionRatio::default(),
+            Arc::new(PlaybackMetrics::default()),
         )
         .unwrap();
         let source = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
         let destination = SocketAddrV4::new(Ipv4Addr::LOCALHOST, receiver.local_addr.port());
         source.send_to(&vec![0; 2_000], destination).unwrap();
-        source.send_to(&packet(1, 0), destination).unwrap();
+        for slot in 0..7 {
+            source.send_to(&packet(1, slot), destination).unwrap();
+        }
         assert!(wait_until(Duration::from_secs(1), || {
             receiver.metrics.status() == Status::Receiving
+        }));
+        assert!(wait_until(Duration::from_secs(1), || {
+            receiver.metrics.queue_evicted_blocks() >= 3
         }));
         assert!(wait_until(Duration::from_secs(2), || {
             receiver.metrics.status() == Status::Listening
         }));
+        let evicted = receiver.metrics.queue_evicted_blocks();
+        assert!(evicted >= 3);
 
         source.send_to(&packet(2, 100), destination).unwrap();
         assert!(wait_until(Duration::from_secs(1), || {
             receiver.metrics.status() == Status::Receiving
         }));
+        assert_eq!(receiver.metrics.queue_evicted_blocks(), evicted);
         assert!(receiver.worker.errors.try_recv().is_err());
         receiver.worker.cancel();
         receiver.worker.join().unwrap();
@@ -598,10 +748,207 @@ mod tests {
             10,
             BlockQueue::new(PLAYBACK_QUEUE_BLOCKS),
             ConsumptionRatio::default(),
+            Arc::new(PlaybackMetrics::default()),
         )
         .err()
         .unwrap();
         assert_eq!(error.code, ErrorCode::WorkerFailed);
         assert!(error.message.contains("cannot bind UDP receiver port"));
+    }
+
+    // 5 ms virtual ticks, 0/2/7 ms deterministic delivery jitter, one dropped
+    // packet per 997, with a separate +/-100 ppm simulated playback clock.
+    // All receiver operations below are the production accept/playout/control
+    // path; only sockets, WASAPI and the PCM conversion are modeled.
+    fn simulate(sender_ppm: f64, reverse: bool) {
+        let start = Instant::now();
+        let blocks = BlockQueue::new(PLAYBACK_QUEUE_BLOCKS);
+        let ratio = ConsumptionRatio::default();
+        let playback = PlaybackMetrics {
+            output_rate: AtomicU32::new(48_000),
+            padding_frames: AtomicU32::new(240),
+            resampler_delay_frames: AtomicU32::new(64),
+            ..PlaybackMetrics::default()
+        };
+        let mut receiver = state(Ipv4Addr::LOCALHOST, 30);
+        let mut packets = Vec::new();
+        let mut next_sender = 0.; // nanoseconds on the wall clock
+        let mut next_playback = 0.;
+        let mut slot = 0u64;
+        let mut pending_frames = 0f64;
+        let mut missing = 0f64;
+        let mut loss = 0u64;
+        let mut maximum = 0f64;
+        let mut midpoint_ratio = 1.;
+        let mut final_ratio = 1.;
+        let mut midpoint_playout = 1.;
+        let mut final_playout = 1.;
+        let mut early_total = 0.;
+        let mut late_total = 0.;
+        let mut late_missing_start = 0.;
+        let mut late_evictions_start = 0;
+        for tick in 0..720_000u64 {
+            let now_ns = tick * 5_000_000;
+            let now = start + Duration::from_nanos(now_ns);
+            let rate = if reverse && tick >= 360_000 {
+                -sender_ppm
+            } else {
+                sender_ppm
+            };
+            while next_sender <= now_ns as f64 {
+                if !slot.is_multiple_of(997) || slot == 0 {
+                    packets.push((
+                        next_sender as u64 + [0, 2, 7, 1][slot as usize % 4] * 1_000_000,
+                        slot,
+                    ));
+                }
+                slot += 1;
+                next_sender += 5_000_000. / (1. + rate / 1_000_000.);
+            }
+            let mut index = 0;
+            while index < packets.len() {
+                if packets[index].0 <= now_ns {
+                    let (_, slot) = packets.swap_remove(index);
+                    receiver.accept(source(Ipv4Addr::LOCALHOST), &packet(1, slot), now);
+                } else {
+                    index += 1;
+                }
+            }
+            assert!(
+                !receiver.expire(now, &blocks, &ratio),
+                "stream timed out at {tick}"
+            );
+            loss += receiver.playout(now, &blocks);
+            while next_playback <= now_ns as f64 {
+                let required = 240. * ratio.get() as f64;
+                while pending_frames < required {
+                    if blocks.pop().is_some() {
+                        pending_frames += 240.;
+                    } else {
+                        break;
+                    }
+                }
+                if pending_frames < required {
+                    missing += required - pending_frames;
+                    pending_frames = 0.;
+                } else {
+                    pending_frames -= required;
+                }
+                next_playback += 5_000_000. / (1. - 100. / 1_000_000.);
+            }
+            playback
+                .pending_input_frames
+                .store(pending_frames as u32, Ordering::Relaxed);
+            let total = receiver.correct(now, &blocks, &ratio, &playback);
+            if tick > 12_000 {
+                maximum = maximum.max(total.unwrap());
+            }
+            if (60_000..120_000).contains(&tick) {
+                early_total += total.unwrap();
+            }
+            if tick >= 660_000 {
+                late_total += total.unwrap();
+                if tick == 660_000 {
+                    late_missing_start = missing;
+                    late_evictions_start = receiver.queue_evicted_blocks;
+                }
+            }
+            if tick == 340_000 {
+                midpoint_ratio = ratio.get();
+                midpoint_playout = receiver.playout_control.ratio();
+            }
+            if tick == 700_000 {
+                final_ratio = ratio.get();
+                final_playout = receiver.playout_control.ratio();
+            }
+            assert!(receiver.jitter.occupancy() <= 40);
+            assert!(blocks.len() <= PLAYBACK_QUEUE_BLOCKS);
+        }
+        // At a -100 ppm playback clock the expected correction is sender ppm
+        // minus playback ppm. Reversal must cross nominal in the other direction.
+        let expected_first = sender_ppm + 100.;
+        let expected_last = if reverse {
+            -sender_ppm + 100.
+        } else {
+            expected_first
+        };
+        assert!(
+            (midpoint_ratio as f64 - (1. + expected_first / 1e6)).abs() < 0.0005,
+            "midpoint ratio={midpoint_ratio} expected ppm={expected_first}"
+        );
+        assert!(
+            (final_ratio as f64 - (1. + expected_last / 1e6)).abs() < 0.0005,
+            "final ratio={final_ratio} expected ppm={expected_last}"
+        );
+        assert_eq!(midpoint_ratio > 1., expected_first > 0.);
+        assert_eq!(final_ratio > 1., expected_last > 0.);
+        assert_eq!(midpoint_playout > 1., sender_ppm > 0.);
+        assert_eq!(
+            final_playout > 1.,
+            (if reverse { -sender_ppm } else { sender_ppm }) > 0.
+        );
+        assert!(maximum < 4_000., "total occupancy grew to {maximum} frames");
+        let early_average = early_total / 60_000.;
+        let late_average = late_total / 60_000.;
+        let target = 30. * 48. + 2. * 240. + 240. + 64.;
+        for average in [early_average, late_average] {
+            assert!(
+                (average - target).abs() < 480.,
+                "occupancy {average} frames outside target {target} +/- 480"
+            );
+        }
+        assert!(
+            (late_average - early_average).abs() < 480.,
+            "occupancy trend: {early_average} to {late_average} frames"
+        );
+        assert!(loss > 100, "injected packet losses must be visible");
+        assert!(missing < 25_000., "playback underrun {missing} frames");
+        // Do not hide recurring underruns behind the startup underflow count.
+        assert!(
+            missing - late_missing_start < 2_400.,
+            "underruns continued after settling: {missing} total"
+        );
+        assert!(receiver.jitter.local_skipped_blocks() < 10);
+        assert!(
+            receiver.queue_evicted_blocks - late_evictions_start < 10,
+            "playback queue kept evicting: {} total",
+            receiver.queue_evicted_blocks
+        );
+        // The real receiver checks idle timeout before catch-up. Old audio and
+        // controller history must be discarded, while eviction counts survive.
+        let stalled = start + Duration::from_secs(3_700);
+        let evictions_before_reset = receiver.queue_evicted_blocks;
+        assert!(receiver.expire(stalled, &blocks, &ratio));
+        assert!(blocks.is_empty());
+        assert_eq!(receiver.jitter.occupancy(), 0);
+        assert_eq!(receiver.media_clock, None);
+        assert_eq!(receiver.queue_evicted_blocks, evictions_before_reset);
+        assert_eq!(ratio.get(), 1.);
+        assert_eq!(receiver.playout_control.ratio(), 1.);
+        assert_eq!(receiver.playback_control.ratio(), 1.);
+        assert_eq!(receiver.playout(stalled, &blocks), 0);
+        assert!(receiver.accept(source(Ipv4Addr::LOCALHOST), &packet(2, 800_000), stalled));
+        assert_eq!(receiver.correct(stalled, &blocks, &ratio, &playback), None);
+        assert_eq!(
+            receiver.playout(stalled + Duration::from_millis(29), &blocks),
+            0
+        );
+        assert_eq!(receiver.jitter.occupancy(), 1);
+        assert_eq!(ratio.get(), 1.);
+    }
+
+    #[test]
+    fn drift_hour_faster_sender() {
+        simulate(200., false);
+    }
+
+    #[test]
+    fn drift_hour_slower_sender() {
+        simulate(-200., false);
+    }
+
+    #[test]
+    fn drift_direction_reversal() {
+        simulate(200., true);
     }
 }
